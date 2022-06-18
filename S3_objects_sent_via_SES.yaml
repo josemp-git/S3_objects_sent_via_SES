@@ -1,0 +1,184 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Objects are sent to an email address via SES as file attachments once these are put in an Amazon S3 bucket
+Parameters: 
+  bucket: 
+    Description: Enter a name for your Amazon S3 bucket
+    Type: String
+  EmailFrom:
+    Description: Email address to send from - this email addressed will be registered as an entity in Amazon SES
+    Type: String
+  EmailTo:
+    Description: Email address(es) to send to - use coma to separate email addresses.
+    Type: String
+
+Resources:
+  LambdaFunction:
+    DependsOn: Role
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.9
+      Role: !GetAtt Role.Arn
+      Handler: index.lambda_handler
+      Timeout: 10
+      Description: "Lambda function"
+      FunctionName: "S3_objects_sent_via_SES"
+      Environment:
+         Variables:
+          bodytext: 'This is an email with an attachment!'
+          from: !Ref EmailFrom
+          to: !Ref EmailTo
+          subject: 'This is an email with an attachment!'
+      Code:  
+        ZipFile: |        
+          import boto3
+          from datetime import datetime
+          from os import environ
+          from email import encoders
+          from email.mime.base import MIMEBase
+          from email.mime.application import MIMEApplication
+          from email.mime.multipart import MIMEMultipart
+          from email.mime.text import MIMEText
+
+          def lambda_handler(event, context):
+
+              #Object and bucket names are taken from the PUT
+              bucket_name = event['Records'][0]['s3']['bucket']['name']
+              object_name = event['Records'][0]['s3']['object']['key']
+
+              def save_in_dynamo():
+                  #S3 object URI
+                  s3_uri = 's3://' + bucket_name + '/' + object_name
+
+                  #Record the time in which the object is put in the S3 bucket
+                  now = datetime.now()
+                  creation_time = now.strftime('%Y-%m-%d, %H:%M:%S')
+
+                  #Put objects are saved in a DynamoDB table along with the S3 object URI and creation time. This can help track when objects were put in the S3 buckets and emails were sent.
+                  dynamodb = boto3.resource('dynamodb')
+                  table = dynamodb.Table('S3_objects_sent_via_SES') 
+                  table.put_item(Item={
+                          'Object_name': object_name,
+                          'Creation_time': creation_time,
+                          'S3_URI': s3_uri
+                      })
+              
+              def send_email_with_file():
+              
+                  #Email message is sent via SES with file attached to it.
+              
+                  #Download file from S3
+                  s3Resource = boto3.resource('s3')
+                  s3Resource.Object(bucket_name, object_name).download_file('/tmp/' + object_name)
+                  filename = '/tmp/' + object_name
+
+                  #Email parameters
+                  msg = MIMEMultipart()
+                  msg["Subject"] = environ['subject']
+                  msg["From"] = environ['from']
+                  msg["To"] = environ['to']
+
+                  # Set message body
+                  body = MIMEText(environ['bodytext'], "plain")
+                  msg.attach(body)
+
+                  with open(filename, "rb") as attachment:
+                      part = MIMEApplication(attachment.read())
+                      part.add_header("Content-Disposition",
+                                      "attachment",
+                                      filename=filename)
+                  msg.attach(part)
+
+                  # Convert message to string and send
+                  ses_client = boto3.client("ses", region_name="us-east-1")
+                  response = ses_client.send_raw_email(
+                      #Optional parameters, read Boto3 documentation: https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/ses.html#SES.Client.send_raw_email
+                      #Source=environ['from']
+                      #Destinations=[environ['to']],
+                      RawMessage={"Data": msg.as_string()}
+                      )
+              
+              #Executes function to add entries to a DynamoDB table. Comment the line below if you do not want to track objects with DynamoDB.
+              save_in_dynamo()
+
+              #Sends email with file attached to it
+              send_email_with_file()
+
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref bucket
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:Put
+            Function: !GetAtt [ LambdaFunction, Arn]
+
+  InvokePermission:
+    Type: AWS::Lambda::Permission
+    DependsOn: LambdaFunction
+    Properties:
+      FunctionName: !GetAtt LambdaFunction.Arn
+      Action: "lambda:InvokeFunction"
+      Principal: "s3.amazonaws.com"
+      SourceArn: !Sub 'arn:aws:s3:::${bucket}'
+      SourceAccount: !Ref 'AWS::AccountId'
+
+  LambdaFunctionLogs:
+    Type: AWS::Logs::LogGroup
+    Properties: 
+      LogGroupName: "/aws/lambda/S3_objects_sent_via_SES"
+
+  DynamoDBTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions: 
+          - 
+            AttributeName: "Object_name"
+            AttributeType: "S"
+      KeySchema: 
+          - 
+            AttributeName: "Object_name"
+            KeyType: "HASH"
+      TableName: "S3_objects_sent_via_SES"
+      BillingMode: PAY_PER_REQUEST
+  
+  Role:
+    Type: 'AWS::IAM::Role'
+    DependsOn: [DynamoDBTable, LambdaFunctionLogs]
+    Properties:
+      RoleName: S3_objects_sent_via_SES_Role
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+              - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Policies:
+        - PolicyName: S3_objects_sent_via_SES_Policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                - "logs:CreateLogGroup"
+                - "logs:CreateLogStream"
+                - "logs:PutLogEvents"
+                Resource: !GetAtt LambdaFunctionLogs.Arn
+              - Effect: Allow
+                Action:
+                - "dynamodb:PutItem"
+                Resource: !GetAtt DynamoDBTable.Arn
+              - Effect: Allow
+                Action:
+                - "s3:GetObject"
+                Resource: !Sub 'arn:aws:s3:::${bucket}/*'
+              - Effect: Allow
+                Action:
+                - "ses:SendRawEmail"
+                Resource: "arn:aws:ses:*:*:identity/*"
+Outputs:
+  Bucket:
+    Description: S3 bucket
+    Value: !Ref bucket
